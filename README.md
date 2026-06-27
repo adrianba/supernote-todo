@@ -308,6 +308,31 @@ def execute_sql_docker(sql: str) -> list[dict]:
 | `is_deleted` | `char(2)` | `'N'` or `'Y'` |
 | `create_time` | `bigint(20)` | Creation timestamp (ms) |
 
+### `u_user` — Users Table
+
+Identifies the user that tasks belong to. The `user_id` column links to the `user_id` field in `t_schedule_task` and `t_schedule_task_group`.
+
+| Column | Type | Null | Key | Default | Description |
+|--------|------|------|-----|---------|-------------|
+| `user_id` | `bigint(20) unsigned` | NO | PRI | `0` | Unique user identifier (matches `user_id` in tasks/categories) |
+| `user_name` | `varchar(100)` | NO | | | Display name |
+| `email` | `varchar(50)` | YES | UNI | `NULL` | Email address (unique) |
+| `sex` | `char(2)` | NO | | `1` | Gender code |
+| `birthday` | `varchar(24)` | YES | | | Birthday |
+| `personal_sign` | `varchar(150)` | YES | | `NULL` | Personal signature / bio |
+| `hobby` | `varchar(20)` | YES | | `NULL` | Hobby |
+| `education` | `varchar(24)` | YES | | `NULL` | Education |
+| `job` | `varchar(32)` | YES | | `NULL` | Job |
+| `avatars_url` | `varchar(100)` | YES | | `NULL` | Avatar image URL |
+| `address` | `varchar(255)` | YES | | `NULL` | Address |
+| `password` | `varchar(32)` | NO | | `NULL` | Password (hashed) |
+| `create_time` | `datetime` | NO | | `NULL` | Account creation time |
+| `update_time` | `datetime` | NO | | `NULL` | Last update time |
+| `is_normal` | `char(2)` | NO | | `Y` | Account active flag (`Y`/`N`) |
+| `file_server` | `char(2)` | YES | | | File server identifier |
+| `avatars_position` | `varchar(30)` | YES | | `NULL` | Avatar crop/position metadata |
+| `account_status` | `char(2)` | YES | | `N` | Account status |
+
 ### Key Concepts
 
 - **Inbox**: Tasks with `task_list_id = NULL` — there is no explicit Inbox category row.
