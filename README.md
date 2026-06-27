@@ -288,14 +288,14 @@ def execute_sql_docker(sql: str) -> list[dict]:
 | `is_deleted` | `char(2)` | `'N'` = active, `'Y'` = soft-deleted |
 | `is_reminder_on` | `char(2)` | `'N'` or `'Y'` |
 | `recurrence` | `varchar(255)` | Recurrence pattern (empty string = none) |
-| `sort` | `int(11)` | Sort order |
-| `sort_completed` | `int(11)` | Completed tasks sort order |
-| `planer_sort` | `int(11)` | Planner view sort |
-| `all_sort` | `int(11)` | All tasks view sort |
-| `all_sort_completed` | `int(11)` | All completed sort |
-| `sort_time` | `bigint(20)` | Sort timestamp (ms) |
-| `planer_sort_time` | `bigint(20)` | Planner sort timestamp (ms) |
-| `all_sort_time` | `bigint(20)` | All sort timestamp (ms) |
+| `sort` | `int(11)` | **Required (non-NULL).** Position of the task within its list (`task_list_id`). Device assigns `0, 1, 2, …`. ⚠️ See [Sort Fields & Device Visibility](#sort-fields--device-visibility). |
+| `sort_completed` | `int(11)` | **Required (non-NULL).** Completed-view order. `0` for active tasks. |
+| `planer_sort` | `int(11)` | **Required (non-NULL).** Planner-view order. `0` by default. |
+| `all_sort` | `int(11)` | "All" view order. Leave **`NULL`** (device leaves it unset). |
+| `all_sort_completed` | `int(11)` | "All" completed order. Leave **`NULL`**. |
+| `sort_time` | `bigint(20)` | Sort tie-break timestamp (ms). Set to `last_modified`. |
+| `planer_sort_time` | `bigint(20)` | Planner timestamp (ms). `0` unless the task has a due date, in which case the device sets it to the planner/due time. |
+| `all_sort_time` | `bigint(20)` | "All" sort timestamp. Leave **`NULL`** (device leaves it unset). |
 
 ### `t_schedule_task_group` — Categories/Lists
 
@@ -340,6 +340,39 @@ Identifies the user that tasks belong to. The `user_id` column links to the `use
 - **Timestamps**: All timestamps are **Unix epoch in milliseconds** (multiply Python's `time.time()` by 1000).
 - **Status**: Only two values — `'needsAction'` (open) and `'completed'` (done).
 - **Task IDs**: 32-character lowercase hex strings. Generate with `uuid.uuid4().hex`.
+- **Sort fields are required**: Tasks inserted with `NULL` integer sort columns may **not show up on the device**. See below.
+
+### Sort Fields & Device Visibility
+
+> ⚠️ **A task will not appear in the device To-Do app unless its integer sort
+> columns are populated.** This was confirmed by comparing tasks created on the
+> device (visible) against the schema's defaults.
+
+The device maintains separate ordering for each To-Do view (the list view, the
+Planner view, and the "All" view). Each has an integer order column and a
+matching timestamp column. From live device-created tasks, the working
+convention is:
+
+| Column | Set to | Notes |
+|--------|--------|-------|
+| `sort` | **next position in the list** (`0, 1, 2, …`) | Per `task_list_id`. Must be non-NULL. This is the field most responsible for visibility. |
+| `sort_completed` | `0` | Non-NULL. |
+| `planer_sort` | `0` | Non-NULL. |
+| `all_sort` | `NULL` | Device leaves this unset. |
+| `all_sort_completed` | `NULL` | Device leaves this unset. |
+| `sort_time` | `last_modified` (now, in ms) | Tie-break timestamp. |
+| `planer_sort_time` | `0` (or the planner/due time for a dated task) | Only the device's dated tasks carried a non-zero value here. |
+| `all_sort_time` | `NULL` | Device leaves this unset. |
+
+The simplest safe default is to set `sort` to the next index within the list
+(`SELECT COALESCE(MAX(sort), -1) + 1 FROM t_schedule_task WHERE task_list_id <=> %s AND is_deleted = 'N'`),
+`sort_completed`/`planer_sort`/`planer_sort_time` to `0`, `sort_time` to the
+current time in ms, and leave `all_sort`, `all_sort_completed`, and
+`all_sort_time` as `NULL`. (Using a constant `0` for `sort` also works but all
+tasks in a list will share an order.)
+
+> 💡 This requirement was first surfaced by the r/Supernote_dev community
+> (thread `1towv4r`) and confirmed here against live database rows.
 
 ---
 
@@ -593,6 +626,12 @@ def create_task(
     due_time = datetime_to_ms(due_date) if due_date else 0
     completed_time = datetime_to_ms(datetime.now()) if status == "completed" else 0
 
+    # Sort fields MUST be populated or the task won't appear on the device.
+    # `sort` is the task's position within its list; use the next free index.
+    sort_index = get_next_sort_index(conn, category_id)
+    # Planner timestamp is 0 unless the task is dated (has a due date).
+    planer_sort_time = due_time if due_time else 0
+
     sql = """
     INSERT INTO t_schedule_task (
         task_id, task_list_id, user_id, title, detail,
@@ -604,16 +643,33 @@ def create_task(
         %s, %s, %s, %s, %s,
         %s, 'N', %s, NULL,
         %s, %s, NULL, 'N',
-        NULL, NULL, NULL, NULL, NULL, %s, %s, %s
+        %s, 0, 0, NULL, NULL, %s, %s, NULL
     );
     """
     with conn.cursor() as cur:
         cur.execute(sql, (
             task_id, category_id, user_id, encoded_title, encoded_detail,
             ts, status,
-            due_time, completed_time, ts, ts, ts,
+            due_time, completed_time, sort_index, ts, planer_sort_time,
         ))
     return task_id
+
+
+def get_next_sort_index(conn, category_id: str | None) -> int:
+    """Return the next `sort` position for a task within its list.
+
+    Tasks are ordered per-list by the integer `sort` column. New tasks go to
+    the end. `category_id` is None for the Inbox (task_list_id IS NULL).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(MAX(sort), -1) + 1 AS next_sort "
+            "FROM t_schedule_task "
+            "WHERE task_list_id <=> %s AND is_deleted = 'N'",
+            (category_id,),
+        )
+        row = cur.fetchone()
+        return int(row["next_sort"]) if row and row["next_sort"] is not None else 0
 
 
 def get_user_id(conn) -> int:
@@ -722,6 +778,12 @@ def uncomplete_task(conn, task_id: str):
     """Mark a task as active again."""
     update_task(conn, task_id, status="needsAction")
 ```
+
+> **Note:** On device-created active tasks, `sort_completed` is `0`. We don't
+> have a confirmed sample of how the device sets `sort_completed` when a task is
+> completed (it likely becomes a position index in the completed view). Leaving
+> it at `0` works for read/write round-trips; if completed-task ordering looks
+> off on-device, set `sort_completed` to the next index among completed tasks.
 
 ### Soft-Delete a Task
 
@@ -1089,12 +1151,30 @@ These aspects of the Supernote device sync are undocumented:
 - **WebSocket protocol** — port 18072 carries the sync traffic, but the protocol is proprietary and undocumented
 - **Concurrent write handling** — does MariaDB row-level locking protect against race conditions, or could partial updates occur?
 - **Field-level vs. row-level sync** — does the device sync entire rows or individual changed fields?
+- **`all_sort*` columns** — `all_sort`, `all_sort_completed`, and `all_sort_time` are `NULL` on device-created tasks, so their exact role in the "All" view is unconfirmed. Leaving them `NULL` works (see [Sort Fields & Device Visibility](#sort-fields--device-visibility)).
 
 For most use cases (creating tasks, marking complete, reading), these unknowns don't matter. They only become relevant if you're doing high-frequency writes or modifying the same tasks the user is actively editing on the device.
 
 ---
 
 ## 9. Important Gotchas & Tips
+
+### Tasks Don't Appear on the Device
+
+If a task you inserted via SQL never shows up in the device To-Do app, the most
+likely cause is **NULL integer sort columns**. The device requires `sort`,
+`sort_completed`, and `planer_sort` to be non-NULL. Populate them as described in
+[Sort Fields & Device Visibility](#sort-fields--device-visibility):
+
+```sql
+-- ✅ Visible: integer sort columns populated
+sort = <next index in list>, sort_completed = 0, planer_sort = 0,
+sort_time = <now ms>, planer_sort_time = 0,
+all_sort = NULL, all_sort_completed = NULL, all_sort_time = NULL
+
+-- ❌ Hidden: integer sort columns left NULL
+sort = NULL, sort_completed = NULL, planer_sort = NULL
+```
 
 ### Timestamps Are Milliseconds
 
@@ -1230,13 +1310,23 @@ else:
     user_id = row["id"] if row else 1
 ts = now_ms()
 
+# Inbox task (task_list_id = NULL): use the next sort index for the Inbox.
+cur.execute(
+    "SELECT COALESCE(MAX(sort), -1) + 1 AS next_sort FROM t_schedule_task "
+    "WHERE task_list_id IS NULL AND is_deleted = 'N'"
+)
+sort_index = cur.fetchone()["next_sort"]
+
+# Populate the integer sort columns — tasks with NULL sort won't show on-device.
 cur.execute("""
     INSERT INTO t_schedule_task
     (task_id, task_list_id, user_id, title, detail, last_modified,
      is_reminder_on, status, due_time, completed_time, is_deleted,
+     sort, sort_completed, planer_sort, all_sort, all_sort_completed,
      sort_time, planer_sort_time, all_sort_time)
-    VALUES (%s, NULL, %s, %s, %s, %s, 'N', 'needsAction', 0, 0, 'N', %s, %s, %s)
-""", (task_id, user_id, "Test task from Python", "", ts, ts, ts, ts))
+    VALUES (%s, NULL, %s, %s, %s, %s, 'N', 'needsAction', 0, 0, 'N',
+            %s, 0, 0, NULL, NULL, %s, 0, NULL)
+""", (task_id, user_id, "Test task from Python", "", ts, sort_index, ts))
 print(f"Created task: {task_id}")
 
 # 3. Complete it
